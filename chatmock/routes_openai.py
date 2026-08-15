@@ -747,14 +747,14 @@ def _run_image_request(
     *,
     session_id: str | None,
     verbose: bool,
-) -> tuple[List[Dict[str, Any]], Dict[str, Any] | None, Response | None]:
+) -> tuple[List[Dict[str, Any]], Dict[str, Any] | None, Response | None, str]:
     upstream, error_resp = start_upstream_raw_request(
         upstream_payload,
         session_id=session_id,
         stream=True,
     )
     if error_resp is not None:
-        return [], None, error_resp
+        return [], None, error_resp, ""
 
     record_rate_limits_from_response(upstream)
 
@@ -783,13 +783,13 @@ def _run_image_request(
             return _run_image_request(retry_payload, session_id=session_id, verbose=verbose)
 
         message = err_info.get("message") or "Upstream error"
-        return [], None, _images_error(str(message), upstream.status_code)
+        return [], None, _images_error(str(message), upstream.status_code), ""
 
-    images, usage, error = collect_images_from_sse(upstream)
+    images, usage, error, said = collect_images_from_sse(upstream)
     if error is not None:
         message = error.get("message") if isinstance(error, dict) else None
-        return [], None, _images_error(str(message or "Upstream error"), 502)
-    return images, usage, None
+        return [], None, _images_error(str(message or "Upstream error"), 502), said
+    return images, usage, None, said
 
 
 @openai_bp.route("/v1/images/generations", methods=["POST"])
@@ -859,14 +859,19 @@ def images_generations() -> Response:
     collected: List[Dict[str, Any]] = []
     usage_totals: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     saw_usage = False
+    # Kept across rounds: with n > 1 the last round is the one that explains an
+    # empty result, and each round overwrites the previous.
+    last_text = ""
     for _ in range(n):
-        images, usage, error_resp = _run_image_request(
+        images, usage, error_resp, said = _run_image_request(
             upstream_payload,
             session_id=session_id,
             verbose=verbose,
         )
         if error_resp is not None:
             return error_resp
+        if said:
+            last_text = said
         collected.extend(images)
         normalized_usage = usage_to_openai(usage)
         if normalized_usage:
@@ -875,9 +880,20 @@ def images_generations() -> Response:
                 usage_totals[key] += int(normalized_usage.get(key) or 0)
 
     if not collected:
+        # Say what the model said, instead of guessing why it stopped. This
+        # error used to assert the prompt "usually" hit moderation, which was
+        # never verified: the text that carries the actual reason was being
+        # thrown away one function up.
+        spoken = last_text.strip()
+        if spoken:
+            detail = f' The model answered instead of drawing: "{spoken[:400]}"'
+        else:
+            detail = (
+                " It returned no text either, so the request was most likely stopped before the "
+                "model started working."
+            )
         return _images_error(
-            "The model finished without generating an image, which usually means the prompt was "
-            "refused by moderation.",
+            "The model finished without generating an image." + detail,
             502,
             code="no_image_returned",
         )

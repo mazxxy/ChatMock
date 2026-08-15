@@ -763,6 +763,47 @@ class ImageRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 502)
         self.assertEqual(response.get_json()["error"]["code"], "no_image_returned")
 
+    @patch("chatmock.routes_openai.start_upstream_raw_request")
+    def test_images_generations_reports_what_the_model_said(self, mock_start) -> None:
+        """An empty result must carry the model's own words.
+
+        The error used to assert the prompt "usually" hit moderation, which
+        nobody had verified: the text that holds the real reason was collected
+        by the stream reader and then dropped. Whoever hits this needs the
+        reason, not a guess.
+        """
+        mock_start.return_value = (
+            FakeUpstream(
+                [
+                    {
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": "I can't draw that logo."}],
+                        },
+                    },
+                    {"type": "response.completed", "response": {"id": "r", "output": []}},
+                ]
+            ),
+            None,
+        )
+        response = self.client.post("/v1/images/generations", json={"prompt": "x"})
+        self.assertEqual(response.status_code, 502)
+        body = response.get_json()["error"]
+        self.assertEqual(body["code"], "no_image_returned")
+        self.assertIn("draw that logo", body["message"])
+
+    @patch("chatmock.routes_openai.start_upstream_raw_request")
+    def test_images_generations_says_when_nothing_came_back(self, mock_start) -> None:
+        """No image and no text is a different failure, and says so."""
+        mock_start.return_value = (
+            FakeUpstream([{"type": "response.completed", "response": {"id": "r", "output": []}}]),
+            None,
+        )
+        response = self.client.post("/v1/images/generations", json={"prompt": "x"})
+        message = response.get_json()["error"]["message"]
+        self.assertIn("no text either", message)
+
     def test_images_generations_rejects_url_response_format(self) -> None:
         response = self.client.post(
             "/v1/images/generations", json={"prompt": "x", "response_format": "url"}
