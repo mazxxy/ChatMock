@@ -785,6 +785,39 @@ class ImageRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("data:image/png;base64,QUJD", body["choices"][0]["message"]["content"])
 
+    @patch("chatmock.routes_openai.start_upstream_request")
+    def test_chat_stream_closes_think_tag_before_image(self, mock_start) -> None:
+        mock_start.return_value = (
+            FakeUpstream(
+                [
+                    {"type": "response.reasoning_summary_text.delta", "delta": "planning"},
+                    {"type": "response.output_item.done", "output_index": 0, "item": IMAGE_ITEM},
+                    {"type": "response.completed", "response": {"id": "resp_img", "output": []}},
+                ]
+            ),
+            None,
+        )
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "gpt-5.4-mini",
+                "messages": [{"role": "user", "content": "draw a cube"}],
+                "responses_tools": [{"type": "image_generation"}],
+                "stream": True,
+            },
+        )
+        content = ""
+        for line in response.get_data(as_text=True).splitlines():
+            if not line.startswith("data: ") or line[6:].strip() == "[DONE]":
+                continue
+            event = json.loads(line[6:])
+            content += (event.get("choices") or [{}])[0].get("delta", {}).get("content") or ""
+        image_at = content.find("data:image/")
+        self.assertGreater(image_at, -1)
+        # The image is output, not reasoning: it must land after the reasoning
+        # block is closed, or clients that hide <think> hide the image with it.
+        self.assertIn("</think>", content[:image_at])
+
     @patch("chatmock.routes_openai.start_upstream_raw_request")
     def test_responses_route_rebuilds_output_from_done_items(self, mock_start) -> None:
         mock_start.return_value = (

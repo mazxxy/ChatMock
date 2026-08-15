@@ -12,7 +12,6 @@ from .images_api import (
     IMAGE_TOOL_TYPE,
     MAX_IMAGES_PER_REQUEST,
     build_image_request_payload,
-    collect_images_from_sse,
     image_item_to_openai,
     image_markdown_for_item,
     usage_to_openai,
@@ -23,6 +22,7 @@ from .model_registry import list_public_models
 from .responses_api import (
     ResponsesRequestError,
     aggregate_response_from_sse,
+    collect_images_from_sse,
     extract_client_session_id,
     normalize_responses_payload,
     stream_upstream_bytes,
@@ -733,7 +733,7 @@ def responses_create() -> Response:
 
 
 def _images_error(message: str, status: int, code: str | None = None) -> Response:
-    body: Dict[str, Any] = {"error": {"message": message, "type": "invalid_request_error"}}
+    body: Dict[str, Any] = {"error": {"message": message}}
     if code:
         body["error"]["code"] = code
     resp = make_response(jsonify(body), status)
@@ -745,9 +745,14 @@ def _images_error(message: str, status: int, code: str | None = None) -> Respons
 def _run_image_request(
     upstream_payload: Dict[str, Any],
     *,
+    session_id: str | None,
     verbose: bool,
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any] | None, Response | None]:
-    upstream, error_resp = start_upstream_raw_request(upstream_payload, stream=True)
+    upstream, error_resp = start_upstream_raw_request(
+        upstream_payload,
+        session_id=session_id,
+        stream=True,
+    )
     if error_resp is not None:
         return [], None, error_resp
 
@@ -764,16 +769,18 @@ def _run_image_request(
 
         err_info = err_body.get("error") if isinstance(err_body.get("error"), dict) else {}
         param = err_info.get("param") if isinstance(err_info.get("param"), str) else ""
-        tool = upstream_payload.get("tools", [{}])[0] if upstream_payload.get("tools") else {}
-        # O backend recusa parametros de imagem que ele nao conhece (foi assim com
-        # 'n'). Em vez de repassar o 400, tenta de novo com o tool pelado — o
-        # cliente recebe a imagem, so que sem o ajuste que ele pediu.
+        tools = upstream_payload.get("tools")
+        tool = tools[0] if isinstance(tools, list) and tools and isinstance(tools[0], dict) else {}
+        # The backend refuses image parameters it does not know (that is what
+        # happens with 'n'). Rather than forwarding the 400, retry once with a
+        # bare tool: the caller gets the image, just without the tweak it asked
+        # for.
         if err_info.get("code") == "unknown_parameter" and param.startswith("tools[") and len(tool) > 1:
             if verbose:
-                print(f"[Images] Backend recusou '{param}'; repetindo sem os parametros do tool")
+                print(f"[Images] Backend rejected '{param}'; retrying without the tool parameters")
             retry_payload = dict(upstream_payload)
             retry_payload["tools"] = [{"type": IMAGE_TOOL_TYPE}]
-            return _run_image_request(retry_payload, verbose=verbose)
+            return _run_image_request(retry_payload, session_id=session_id, verbose=verbose)
 
         message = err_info.get("message") or "Upstream error"
         return [], None, _images_error(str(message), upstream.status_code)
@@ -791,6 +798,8 @@ def images_generations() -> Response:
     raw = request.get_data(cache=True, as_text=True) or ""
     if verbose:
         try:
+            # Truncated on purpose: an 'image' reference arrives here as a data
+            # URL and would otherwise dump megabytes into the log.
             print("IN POST /v1/images/generations\n" + raw[:2000])
         except Exception:
             pass
@@ -809,22 +818,22 @@ def images_generations() -> Response:
     response_format = payload.get("response_format")
     if isinstance(response_format, str) and response_format.strip().lower() == "url":
         return _images_error(
-            "response_format 'url' nao existe aqui: o backend devolve a imagem em base64 "
-            "e o ChatMock nao hospeda arquivo. Use 'b64_json'.",
+            "response_format 'url' is not available: the backend returns base64 and ChatMock "
+            "hosts no files. Use 'b64_json'.",
             400,
             code="unsupported_value",
         )
 
     try:
         n = int(payload.get("n") or 1)
-    except Exception:
+    except (TypeError, ValueError):
         return _images_error("Parameter 'n' must be an integer", 400)
     if n < 1:
         return _images_error("Parameter 'n' must be >= 1", 400)
     if n > MAX_IMAGES_PER_REQUEST:
         return _images_error(
-            f"Parameter 'n' must be <= {MAX_IMAGES_PER_REQUEST}: o backend gera uma imagem por "
-            "chamada, entao cada unidade e uma requisicao a mais na sua cota.",
+            f"Parameter 'n' must be <= {MAX_IMAGES_PER_REQUEST}: the backend draws one image per "
+            "call, so every extra unit is another request against your quota.",
             400,
         )
 
@@ -846,11 +855,16 @@ def images_generations() -> Response:
         input_images=[img for img in input_images if isinstance(img, str)],
     )
 
+    session_id = extract_client_session_id(request.headers)
     collected: List[Dict[str, Any]] = []
     usage_totals: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     saw_usage = False
     for _ in range(n):
-        images, usage, error_resp = _run_image_request(upstream_payload, verbose=verbose)
+        images, usage, error_resp = _run_image_request(
+            upstream_payload,
+            session_id=session_id,
+            verbose=verbose,
+        )
         if error_resp is not None:
             return error_resp
         collected.extend(images)
@@ -862,7 +876,8 @@ def images_generations() -> Response:
 
     if not collected:
         return _images_error(
-            "O modelo terminou sem gerar imagem. Costuma ser recusa de moderacao no prompt.",
+            "The model finished without generating an image, which usually means the prompt was "
+            "refused by moderation.",
             502,
             code="no_image_returned",
         )
@@ -874,7 +889,9 @@ def images_generations() -> Response:
     if saw_usage:
         body["usage"] = usage_totals
     if verbose:
-        print(f"OUT POST /v1/images/generations ({len(collected)} imagem(ns))")
+        # Not _log_json: a single image is a couple of megabytes of base64, and
+        # printing the body would drown the log.
+        print(f"OUT POST /v1/images/generations ({len(collected)} image(s))")
 
     resp = make_response(jsonify(body), 200)
     for k, v in build_cors_headers().items():

@@ -1,22 +1,21 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
-# Sem import de outro modulo do pacote aqui em cima de proposito: utils.py
-# importa este arquivo, e model_catalog -> utils fecha o ciclo. O unico import
-# interno fica dentro de collect_images_from_sse.
+# Deliberately free of intra-package imports: utils.py imports this module, and
+# model_catalog -> utils would close the cycle. SSE parsing lives in
+# responses_api.py, which already owns it.
 
 
 IMAGE_TOOL_TYPE = "image_generation"
 
-# Modelo de texto que orquestra a chamada. Quem desenha e sempre o
-# gpt-image-2-codex do lado do backend; este aqui so escreve o prompt revisado,
-# entao o mais barato serve.
+# Model that orchestrates the call. The picture itself is always drawn by the
+# backend's own image model, so the cheapest chat model does the job.
 DEFAULT_IMAGE_ORCHESTRATOR_MODEL = "gpt-5.4-mini"
 
-# Parametros do tool que o backend aceita hoje. 'n' aparece no echo da resposta
-# mas e recusado na entrada ('Unknown parameter: tools[0].n'), por isso nao esta
-# aqui: varias imagens sao varias requisicoes.
+# Tool parameters the backend accepts today. 'n' shows up in the echoed tool
+# config but is refused on input ("Unknown parameter: 'tools[0].n'"), so several
+# images means several requests.
 IMAGE_TOOL_PARAM_KEYS = (
     "size",
     "quality",
@@ -43,15 +42,16 @@ def build_image_tool(params: Dict[str, Any] | None) -> Dict[str, Any]:
 
 
 def size_hint_instruction(size: Any) -> str | None:
-    """O backend ignora `size` (devolve sempre "auto" no echo) e escolhe a
-    proporcao a partir do prompt. Entao o pedido de tamanho vira instrucao em
-    texto, que e a unica via que ele de fato escuta."""
+    """Turn a requested size into plain text.
+
+    The backend ignores the `size` parameter (the echo always reads "auto") and
+    picks the aspect ratio from the prompt, so the request only lands if it is
+    written out for the model to read.
+    """
     if not isinstance(size, str):
         return None
     raw = size.strip().lower()
-    if not raw or raw == "auto":
-        return None
-    if "x" not in raw:
+    if not raw or raw == "auto" or "x" not in raw:
         return None
     left, _, right = raw.partition("x")
     try:
@@ -62,12 +62,12 @@ def size_hint_instruction(size: Any) -> str | None:
     if width <= 0 or height <= 0:
         return None
     if width == height:
-        shape = "quadrada (proporcao 1:1)"
+        shape = "square (1:1)"
     elif width > height:
-        shape = "horizontal (paisagem)"
+        shape = "landscape"
     else:
-        shape = "vertical (retrato)"
-    return f"A imagem deve ser {shape}, o mais proximo possivel de {width}x{height} pixels."
+        shape = "portrait"
+    return f"The image must be {shape}, as close as possible to {width}x{height} pixels."
 
 
 def build_image_request_payload(
@@ -83,8 +83,8 @@ def build_image_request_payload(
             content.append({"type": "input_image", "image_url": url})
 
     instructions = [
-        "Voce gera imagens. Chame a ferramenta de imagem uma unica vez com o "
-        "pedido do usuario e nao escreva nenhum comentario alem disso."
+        "You generate images. Call the image tool exactly once with the user's "
+        "request and write nothing else."
     ]
     hint = size_hint_instruction((tool_params or {}).get("size"))
     if hint:
@@ -107,6 +107,8 @@ def image_item_to_openai(item: Dict[str, Any]) -> Dict[str, Any]:
     revised = item.get("revised_prompt")
     if isinstance(revised, str) and revised.strip():
         out["revised_prompt"] = revised
+    # Not part of the OpenAI schema, but the backend decides these on its own and
+    # the caller has no other way to learn what it actually got.
     for key in ("size", "output_format", "quality", "background"):
         value = item.get(key)
         if value is not None:
@@ -128,52 +130,7 @@ def image_markdown_for_item(item: Dict[str, Any]) -> str:
         return ""
     alt = item.get("revised_prompt")
     alt = alt.replace("\n", " ").strip()[:120] if isinstance(alt, str) else ""
-    return f"\n\n![{alt or 'imagem'}]({url})"
-
-
-def collect_images_from_sse(
-    upstream: Any,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any] | None, Dict[str, Any] | None]:
-    """Le o SSE ate o fim e devolve (itens de imagem, usage, erro).
-
-    O `response.completed` do backend do Codex vem com `output: []`, entao os
-    itens so existem nos eventos `response.output_item.done` — e por isso que
-    esperar pelo objeto final devolve nada."""
-    from .responses_api import iter_sse_event_payloads
-
-    images: List[Dict[str, Any]] = []
-    usage: Dict[str, Any] | None = None
-    error: Dict[str, Any] | None = None
-    try:
-        for evt in iter_sse_event_payloads(upstream):
-            kind = evt.get("type")
-            if kind == "response.output_item.done":
-                item = evt.get("item")
-                if isinstance(item, dict) and item.get("type") == "image_generation_call":
-                    images.append(item)
-            elif kind == "response.failed":
-                response = evt.get("response")
-                if isinstance(response, dict) and isinstance(response.get("error"), dict):
-                    error = response["error"]
-                else:
-                    error = {"message": "response.failed"}
-                break
-            elif kind == "error":
-                error = evt.get("error") if isinstance(evt.get("error"), dict) else {"message": "upstream error"}
-                break
-            elif kind == "response.completed":
-                response = evt.get("response")
-                if isinstance(response, dict):
-                    tool_usage = response.get("tool_usage")
-                    if isinstance(tool_usage, dict) and isinstance(tool_usage.get("image_gen"), dict):
-                        usage = tool_usage["image_gen"]
-                break
-    finally:
-        try:
-            upstream.close()
-        except Exception:
-            pass
-    return images, usage, error
+    return f"\n\n![{alt or 'image'}]({url})"
 
 
 def usage_to_openai(usage: Dict[str, Any] | None) -> Dict[str, Any] | None:
@@ -182,7 +139,7 @@ def usage_to_openai(usage: Dict[str, Any] | None) -> Dict[str, Any] | None:
     try:
         input_tokens = int(usage.get("input_tokens") or 0)
         output_tokens = int(usage.get("output_tokens") or 0)
-    except Exception:
+    except (TypeError, ValueError):
         return None
     return {
         "input_tokens": input_tokens,

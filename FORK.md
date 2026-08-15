@@ -17,9 +17,10 @@ em base64. Medido, não deduzido:
   cota do plano ChatGPT/Codex**, não de crédito de API;
 - `n` no tool é recusado (`Unknown parameter: 'tools[0].n'`): uma imagem por
   requisição;
-- `size` e `quality` são aceitos mas ignorados — o echo volta sempre `"auto"`, e
-  uma imagem pedida em 1024x1024 veio 1254x1254. A proporção é escolhida pelo
-  prompt, não pelo parâmetro.
+- `size` e `quality` são aceitos mas ignorados — o echo volta sempre `"auto"`.
+  A resolução é escolhida a partir do prompt: pedindo 1024x1024 veio 1254x1254,
+  pedindo 1536x1024 veio 1536x1024 na mosca. Ou seja, dá para pedir — só não dá
+  para garantir.
 
 ## O bug que estava por baixo
 
@@ -38,12 +39,12 @@ Corrigido em `chatmock/responses_api.py`: os itens são acumulados por
 
 | Arquivo | Mudança |
 |---|---|
-| `chatmock/images_api.py` | **novo** — monta o payload, lê o SSE, converte para o formato da Images API |
-| `chatmock/responses_api.py` | remonta `output` a partir dos `output_item.done` (o bug acima) |
+| `chatmock/images_api.py` | **novo** — monta o payload e converte para o formato da Images API. Sem import interno de propósito: `utils.py` importa este módulo, e `model_catalog -> utils` fecharia o ciclo |
+| `chatmock/responses_api.py` | remonta `output` a partir dos `output_item.done` (o bug acima); `collect_images_from_sse()`, que fica aqui porque é este o módulo que já lê SSE |
 | `chatmock/routes_openai.py` | rota `/v1/images/generations`; `image_generation` liberado em `responses_tools`; imagem vira data-url no `/v1/chat/completions` |
-| `chatmock/utils.py` | `/v1/chat/completions` com `stream: true` emite a imagem como delta de conteúdo |
+| `chatmock/utils.py` | imagem como delta de conteúdo no chat streaming, **depois** de fechar o `<think>` — o fechamento virou o helper `_close_think_tag()`, usado nos três pontos que antes repetiam o mesmo bloco |
 | `chatmock/app.py`, `chatmock/cli.py` | flag `--image-model` / env `CHATGPT_LOCAL_IMAGE_MODEL` |
-| `tests/test_routes.py` | 7 testes novos |
+| `tests/test_routes.py` | 8 testes novos |
 
 ## Uso
 
@@ -97,6 +98,11 @@ Parâmetros:
 A imagem chega embutida no `content` como `![alt](data:image/png;base64,...)`,
 em streaming ou não. Serve para UIs de chat que renderizam markdown.
 
+Com `--reasoning-compat think-tags` (o padrão), a imagem sai **depois** do
+`</think>`. Sem isso ela cairia dentro do bloco de raciocínio e sumiria em
+qualquer cliente que esconde o `<think>` — que é justamente o motivo do modo
+existir.
+
 ## Limites conhecidos
 
 - **Peso.** Uma imagem passa de 2,5 MB em base64. Não ligue `--verbose` nessas
@@ -109,5 +115,10 @@ em streaming ou não. Serve para UIs de chat que renderizam markdown.
 
 As mudanças em arquivos que já existiam são pequenas e localizadas — o grosso
 está em `images_api.py`, que é arquivo novo. Ao subir de versão, os pontos de
-atrito são `aggregate_response_from_sse()` e os dois trechos de
-`response.output_item.done` (em `routes_openai.py` e `utils.py`).
+atrito são `aggregate_response_from_sse()`, os dois trechos de
+`response.output_item.done` (em `routes_openai.py` e `utils.py`) e o
+`_close_think_tag()`, que substituiu duas cópias de um bloco que o upstream
+repetia dentro de `sse_translate_chat()`.
+
+Comentários e mensagens de erro do código estão em inglês, como o resto do
+repositório — só este arquivo está em português.

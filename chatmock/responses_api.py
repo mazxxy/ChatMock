@@ -171,10 +171,10 @@ def aggregate_response_from_sse(
 ) -> tuple[Dict[str, Any] | None, Dict[str, Any] | None]:
     response_obj: Dict[str, Any] | None = None
     error_obj: Dict[str, Any] | None = None
-    # O backend do Codex manda o `response.completed` com `output: []` — os itens
-    # (texto, function_call, image_generation_call) so chegam nos eventos
-    # `response.output_item.done`. Sem remontar aqui, toda resposta nao-streaming
-    # sai vazia.
+    # The Codex backend sends `response.completed` with `output: []` — the items
+    # (message, function_call, image_generation_call) only ever arrive in the
+    # `response.output_item.done` events. Without rebuilding them here, every
+    # non-streaming response comes out empty.
     done_items: Dict[int, Dict[str, Any]] = {}
     fallback_order = 0
     try:
@@ -212,6 +212,46 @@ def aggregate_response_from_sse(
             response_obj = dict(response_obj)
             response_obj["output"] = [done_items[key] for key in sorted(done_items)]
     return response_obj, error_obj
+
+
+def collect_images_from_sse(
+    upstream: Any,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any] | None, Dict[str, Any] | None]:
+    """Read the stream to the end and return (image items, usage, error).
+
+    Same reason as above: `response.completed` carries no output, so the image
+    items only ever exist in the `response.output_item.done` events.
+    """
+    images: List[Dict[str, Any]] = []
+    usage: Dict[str, Any] | None = None
+    error: Dict[str, Any] | None = None
+    try:
+        for evt in iter_sse_event_payloads(upstream):
+            kind = evt.get("type")
+            if kind == "response.output_item.done":
+                item = evt.get("item")
+                if isinstance(item, dict) and item.get("type") == "image_generation_call":
+                    images.append(item)
+            elif kind == "response.failed":
+                response = evt.get("response")
+                if isinstance(response, dict) and isinstance(response.get("error"), dict):
+                    error = response["error"]
+                else:
+                    error = {"message": "response.failed"}
+                break
+            elif kind == "error":
+                error = evt.get("error") if isinstance(evt.get("error"), dict) else {"message": "upstream error"}
+                break
+            elif kind == "response.completed":
+                response = evt.get("response")
+                if isinstance(response, dict):
+                    tool_usage = response.get("tool_usage")
+                    if isinstance(tool_usage, dict) and isinstance(tool_usage.get("image_gen"), dict):
+                        usage = tool_usage["image_gen"]
+                break
+    finally:
+        upstream.close()
+    return images, usage, error
 
 
 def stream_upstream_bytes(

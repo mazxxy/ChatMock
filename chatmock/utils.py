@@ -472,7 +472,24 @@ def sse_translate_chat(
                 return json.dumps({"query": eff_args})
         else:
             return "{}"
-    
+
+    def _close_think_tag():
+        """Close the reasoning block before emitting real output, so the content
+        never lands inside <think> and gets hidden by the client."""
+        nonlocal think_open, think_closed
+        if compat != "think-tags" or not think_open or think_closed:
+            return
+        close_chunk = {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {"content": "</think>"}, "finish_reason": None}],
+        }
+        yield f"data: {json.dumps(close_chunk)}\n\n".encode("utf-8")
+        think_open = False
+        think_closed = True
+
     def _extract_usage(evt: Dict[str, Any]) -> Dict[str, int] | None:
         try:
             usage = (evt.get("response") or {}).get("usage")
@@ -595,17 +612,7 @@ def sse_translate_chat(
 
             if kind == "response.output_text.delta":
                 delta = evt.get("delta") or ""
-                if compat == "think-tags" and think_open and not think_closed:
-                    close_chunk = {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{"index": 0, "delta": {"content": "</think>"}, "finish_reason": None}],
-                    }
-                    yield f"data: {json.dumps(close_chunk)}\n\n".encode("utf-8")
-                    think_open = False
-                    think_closed = True
+                yield from _close_think_tag()
                 saw_output = True
                 chunk = {
                     "id": response_id,
@@ -620,6 +627,7 @@ def sse_translate_chat(
                 if isinstance(item, dict) and item.get("type") == "image_generation_call":
                     markdown = image_markdown_for_item(item)
                     if markdown:
+                        yield from _close_think_tag()
                         saw_output = True
                         image_chunk = {
                             "id": response_id,
@@ -795,17 +803,7 @@ def sse_translate_chat(
                 m = _extract_usage(evt)
                 if m:
                     upstream_usage = m
-                if compat == "think-tags" and think_open and not think_closed:
-                    close_chunk = {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{"index": 0, "delta": {"content": "</think>"}, "finish_reason": None}],
-                    }
-                    yield f"data: {json.dumps(close_chunk)}\n\n".encode("utf-8")
-                    think_open = False
-                    think_closed = True
+                yield from _close_think_tag()
                 if not sent_stop_chunk:
                     finish_reason = "tool_calls" if saw_function_call else "stop"
                     chunk = {
