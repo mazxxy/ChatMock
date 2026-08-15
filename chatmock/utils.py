@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from .config import CLIENT_ID_DEFAULT, OAUTH_TOKEN_URL
+from .images_api import image_markdown_for_item
 from .version import __version__
 
 
@@ -616,7 +617,19 @@ def sse_translate_chat(
                 yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
             elif kind == "response.output_item.done":
                 item = evt.get("item") or {}
-                if isinstance(item, dict) and (item.get("type") == "function_call" or item.get("type") == "web_search_call"):
+                if isinstance(item, dict) and item.get("type") == "image_generation_call":
+                    markdown = image_markdown_for_item(item)
+                    if markdown:
+                        saw_output = True
+                        image_chunk = {
+                            "id": response_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {"content": markdown}, "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(image_chunk)}\n\n".encode("utf-8")
+                elif isinstance(item, dict) and (item.get("type") == "function_call" or item.get("type") == "web_search_call"):
                     call_id = item.get("call_id") or item.get("id") or ""
                     name = item.get("name") or ("web_search" if item.get("type") == "web_search_call" else "")
                     raw_args = item.get("arguments") or item.get("parameters")

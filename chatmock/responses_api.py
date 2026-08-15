@@ -171,6 +171,12 @@ def aggregate_response_from_sse(
 ) -> tuple[Dict[str, Any] | None, Dict[str, Any] | None]:
     response_obj: Dict[str, Any] | None = None
     error_obj: Dict[str, Any] | None = None
+    # O backend do Codex manda o `response.completed` com `output: []` — os itens
+    # (texto, function_call, image_generation_call) so chegam nos eventos
+    # `response.output_item.done`. Sem remontar aqui, toda resposta nao-streaming
+    # sai vazia.
+    done_items: Dict[int, Dict[str, Any]] = {}
+    fallback_order = 0
     try:
         for evt in iter_sse_event_payloads(upstream):
             if callable(on_event):
@@ -182,6 +188,14 @@ def aggregate_response_from_sse(
             if isinstance(response, dict):
                 response_obj = response
             kind = evt.get("type")
+            if kind == "response.output_item.done":
+                item = evt.get("item")
+                if isinstance(item, dict):
+                    index = evt.get("output_index")
+                    if not isinstance(index, int):
+                        index = 1_000_000 + fallback_order
+                    fallback_order += 1
+                    done_items[index] = item
             if kind == "response.failed":
                 if isinstance(response, dict) and isinstance(response.get("error"), dict):
                     error_obj = {"error": response.get("error")}
@@ -192,6 +206,11 @@ def aggregate_response_from_sse(
                 break
     finally:
         upstream.close()
+    if isinstance(response_obj, dict) and done_items:
+        existing = response_obj.get("output")
+        if not isinstance(existing, list) or not existing:
+            response_obj = dict(response_obj)
+            response_obj["output"] = [done_items[key] for key in sorted(done_items)]
     return response_obj, error_obj
 
 
