@@ -818,6 +818,22 @@ class ImageRouteTests(unittest.TestCase):
         # block is closed, or clients that hide <think> hide the image with it.
         self.assertIn("</think>", content[:image_at])
 
+    @patch("chatmock.routes_ollama.start_upstream_request")
+    def test_ollama_chat_embeds_image_as_data_url(self, mock_start) -> None:
+        mock_start.return_value = (FakeUpstream(image_sse_events()), None)
+        response = self.client.post(
+            "/api/chat",
+            json={
+                "model": "gpt-5.4-mini",
+                "messages": [{"role": "user", "content": "draw a cube"}],
+                "responses_tools": [{"type": "image_generation"}],
+                "stream": False,
+            },
+        )
+        body = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("data:image/png;base64,QUJD", body["message"]["content"])
+
     @patch("chatmock.routes_openai.start_upstream_raw_request")
     def test_responses_route_rebuilds_output_from_done_items(self, mock_start) -> None:
         mock_start.return_value = (
