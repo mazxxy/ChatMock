@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ChatMock transcription</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 24px; max-width: 900px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  p.sub { margin: 0 0 20px; opacity: .7; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+  label { display: flex; gap: 6px; align-items: center; }
+  input[type=text], select { padding: 6px 8px; font: inherit; }
+  input[type=text] { min-width: 240px; }
+  button { padding: 7px 14px; font: inherit; cursor: pointer; }
+  button[disabled] { opacity: .5; cursor: default; }
+  #text { border: 1px solid currentColor; border-radius: 6px; padding: 12px; min-height: 160px; white-space: pre-wrap; }
+  #log { font-family: ui-monospace, monospace; font-size: 12px; opacity: .75; margin-top: 12px;
+         height: 150px; overflow: auto; white-space: pre-wrap; }
+  .err { color: #c0392b; font-weight: 600; }
+  .partial { opacity: .6; }
+</style>
+</head>
+<body>
+<h1>ChatMock transcription</h1>
+<p class="sub">Streams your microphone to <code>ws://…/v1/realtime?intent=transcription</code> as PCM16. The model is chosen in <code>session.update</code>, never in the query.</p>
+
+<div class="row">
+  <label>Server <input type="text" id="base" value="ws://127.0.0.1:8000" /></label>
+  <label>Model
+    <select id="model">
+      <option>whisper-1</option>
+      <option>gpt-realtime-whisper</option>
+      <option>gpt-live-transcribe</option>
+      <option>gpt-transcribe</option>
+      <option selected>gpt-4o-transcribe</option>
+      <option>gpt-4o-mini-transcribe</option>
+      <option>gpt-4o-mini-transcribe-2025-03-20</option>
+      <option>gpt-4o-mini-transcribe-2025-12-15</option>
+    </select>
+  </label>
+  <label>Language <input type="text" id="lang" placeholder="auto (e.g. pt, en)" style="min-width:120px" /></label>
+</div>
+<div class="row">
+  <button id="start">Start</button>
+  <button id="stop" disabled>Stop</button>
+</div>
+
+<div id="text"></div>
+<div id="log"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const RATE = 24000; // what the realtime input expects
+let ws = null, ctx = null, node = null, micStream = null;
+let settled = "", partial = "";
+
+function log(msg, cls) {
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = `${new Date().toLocaleTimeString()}  ${msg}`;
+  $("log").appendChild(line);
+  $("log").scrollTop = $("log").scrollHeight;
+}
+
+function render() {
+  $("text").innerHTML = "";
+  $("text").append(settled);
+  if (partial) {
+    const span = document.createElement("span");
+    span.className = "partial";
+    span.textContent = partial;
+    $("text").append(span);
+  }
+}
+
+function toBase64(bytes) {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+}
+
+// Float32 from the audio graph -> little-endian PCM16, which is what
+// input_audio_buffer.append wants.
+function encodePcm16(samples) {
+  const out = new DataView(new ArrayBuffer(samples.length * 2));
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    out.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Uint8Array(out.buffer);
+}
+
+async function start() {
+  $("start").disabled = true;
+  settled = ""; partial = ""; render();
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+    });
+  } catch (err) {
+    log(`no microphone: ${err && err.name ? err.name : err}`, "err");
+    $("start").disabled = false;
+    return;
+  }
+
+  ws = new WebSocket(`${$("base").value.replace(/\/+$/, "")}/v1/realtime?intent=transcription`);
+  ws.onerror = () => log("websocket error", "err");
+  ws.onclose = () => { log("session closed"); stop(); };
+
+  ws.onopen = () => {
+    log("session open", "ok");
+    const transcription = { model: $("model").value };
+    const lang = $("lang").value.trim();
+    if (lang) transcription.language = lang;
+    ws.send(JSON.stringify({
+      type: "session.update",
+      session: { type: "transcription", audio: { input: { transcription } } },
+    }));
+
+    ctx = new AudioContext({ sampleRate: RATE });
+    const src = ctx.createMediaStreamSource(micStream);
+    node = ctx.createScriptProcessor(4096, 1, 1);
+    node.onaudioprocess = (e) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const pcm = encodePcm16(e.inputBuffer.getChannelData(0));
+      ws.send(JSON.stringify({ type: "input_audio_buffer.append", audio: toBase64(pcm) }));
+    };
+    src.connect(node);
+    node.connect(ctx.destination);
+    $("stop").disabled = false;
+  };
+
+  ws.onmessage = (e) => {
+    let evt;
+    try { evt = JSON.parse(e.data); } catch { return; }
+    switch (evt.type) {
+      case "session.updated":
+        log(`model: ${evt.session?.audio?.input?.transcription?.model ?? "?"}`, "ok");
+        break;
+      case "conversation.item.input_audio_transcription.delta":
+        partial += evt.delta || "";
+        render();
+        break;
+      case "conversation.item.input_audio_transcription.completed":
+        settled += (evt.transcript || partial) + "\n";
+        partial = "";
+        render();
+        break;
+      case "input_audio_buffer.speech_started":
+        log("speech detected");
+        break;
+      case "error":
+        log(`error: ${JSON.stringify(evt.error || evt)}`, "err");
+        break;
+    }
+  };
+}
+
+function stop() {
+  if (node) { try { node.disconnect(); } catch {} node = null; }
+  if (ctx) { try { ctx.close(); } catch {} ctx = null; }
+  if (micStream) { micStream.getTracks().forEach((t) => { try { t.stop(); } catch {} }); micStream = null; }
+  if (ws && ws.readyState === WebSocket.OPEN) { try { ws.close(); } catch {} }
+  ws = null;
+  $("start").disabled = false;
+  $("stop").disabled = true;
+}
+
+$("start").onclick = start;
+$("stop").onclick = stop;
+</script>
+</body>
+</html>
