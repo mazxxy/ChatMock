@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ChatMock realtime voice probe</title>
+<style>
+  :root { color-scheme: light dark; --gap: 12px; }
+  body { font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 24px; max-width: 900px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  p.sub { margin: 0 0 20px; opacity: .7; }
+  .row { display: flex; gap: var(--gap); flex-wrap: wrap; align-items: center; margin-bottom: var(--gap); }
+  label { display: flex; gap: 6px; align-items: center; }
+  input[type=text] { padding: 6px 8px; font: inherit; min-width: 260px; }
+  button { padding: 7px 14px; font: inherit; cursor: pointer; }
+  button[disabled] { opacity: .5; cursor: default; }
+  #log { white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, monospace; font-size: 12px;
+         border: 1px solid currentColor; border-radius: 6px; padding: 12px; height: 420px; overflow: auto; opacity: .95; }
+  .err { color: #c0392b; font-weight: 600; }
+  .ok { color: #1e8449; font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>ChatMock realtime voice probe</h1>
+<p class="sub">Posts a real WebRTC offer to <code>/v1/realtime/calls</code>. Audio flows straight to OpenAI; ChatMock only brokers the handshake. Turn-taking mode cuts the model off as soon as you speak (semantic VAD); full duplex lets both of you talk at once.</p>
+
+<div class="row">
+  <label>Server <input type="text" id="base" value="http://127.0.0.1:8000" /></label>
+  <label>Model <input type="text" id="model" value="gpt-realtime-1.5" /></label>
+  <label>Voice <select id="voice"></select></label>
+  <label><input type="checkbox" id="duplex" /> Full duplex (GPT-Live)</label>
+</div>
+<div class="row">
+  <button id="start">Start call</button>
+  <button id="stop" disabled>Hang up</button>
+  <button id="mute" disabled>Mute mic</button>
+</div>
+<div class="row">
+  <input type="text" id="say" placeholder="Send text into the live session" />
+  <button id="send" disabled>Send</button>
+</div>
+<audio id="remote" autoplay></audio>
+<div id="log"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const logEl = $("log");
+let pc = null, channel = null, micTrack = null;
+
+// The two modes take disjoint voice rosters: full duplex only answers to the
+// ChatGPT voices, turn-taking only to the API ones. The wrong list is a 403
+// ("Voice session access denied") or a 400 that names the alternatives.
+const VOICES = {
+  duplex: ["vale", "arbor", "breeze", "cove", "ember", "juniper", "maple", "sol", "spruce", "glimmer", "orbit", "fathom"],
+  normal: ["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "marin", "cedar"],
+};
+
+function fillVoices() {
+  const list = $("duplex").checked ? VOICES.duplex : VOICES.normal;
+  $("voice").innerHTML = list.map((v) => `<option>${v}</option>`).join("");
+}
+
+function log(msg, cls) {
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = `${new Date().toLocaleTimeString()}  ${msg}`;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// Trickle ICE has nowhere to go here: the answer comes back from a single POST,
+// so the offer has to carry every candidate it will ever have.
+function waitForIce(peer) {
+  if (peer.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => {
+      if (peer.iceGatheringState === "complete") {
+        peer.removeEventListener("icegatheringstatechange", done);
+        resolve();
+      }
+    };
+    peer.addEventListener("icegatheringstatechange", done);
+    setTimeout(resolve, 3000);
+  });
+}
+
+async function start() {
+  $("start").disabled = true;
+  try {
+    let stream = null;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      micTrack = stream.getAudioTracks()[0];
+      log("microphone granted");
+    } catch (err) {
+      // No microphone is still worth a call: the handshake and the text channel
+      // work, you just cannot talk back.
+      log(`no microphone (${err && err.name ? err.name : err}); going listen-only`);
+    }
+
+    pc = new RTCPeerConnection();
+    if (micTrack) pc.addTrack(micTrack, stream);
+    else pc.addTransceiver("audio", { direction: "recvonly" });
+    pc.ontrack = (e) => { $("remote").srcObject = e.streams[0]; log("remote audio track attached", "ok"); };
+    pc.onconnectionstatechange = () => log(`connection: ${pc.connectionState}`);
+
+    channel = pc.createDataChannel("oai-events");
+    channel.onopen = () => {
+      log("data channel open", "ok");
+      // The text box speaks the turn-taking protocol; full duplex is voice only.
+      $("send").disabled = $("duplex").checked;
+      // Full duplex listens while it speaks, so there is no turn to detect and
+      // nothing to configure here.
+      if ($("duplex").checked) return;
+      // Barge-in: semantic VAD cuts the model off the moment you start
+      // talking, instead of waiting for it to finish its turn.
+      channel.send(JSON.stringify({
+        type: "session.update",
+        session: {
+          type: "realtime",
+          audio: {
+            input: { turn_detection: { type: "semantic_vad", eagerness: "high", interrupt_response: true } },
+            output: { voice: $("voice").value },
+          },
+        },
+      }));
+    };
+    channel.onmessage = (e) => {
+      let evt;
+      try { evt = JSON.parse(e.data); } catch { log(`event (raw): ${e.data}`); return; }
+      const type = evt.type || "?";
+      if (type.endsWith(".delta") && typeof evt.delta === "string") log(`${type}: ${evt.delta}`);
+      else if (type === "error") log(`event error: ${JSON.stringify(evt.error || evt)}`, "err");
+      else if (type === "input_audio_buffer.speech_started") log("you started talking -> cutting it off", "ok");
+      else log(`event: ${type}`);
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await waitForIce(pc);
+    log("offer ready, posting to ChatMock");
+
+    const base = $("base").value.replace(/\/+$/, "");
+    const duplex = $("duplex").checked;
+    // Two different handshakes: turn-taking takes the bare SDP the way the
+    // official docs do, full duplex takes JSON and the quicksilver intent.
+    const res = duplex
+      ? await fetch(`${base}/v1/realtime/calls?intent=quicksilver&architecture=avas`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sdp: pc.localDescription.sdp,
+            model: $("model").value,
+            session: {
+              delegation: { type: "client" },
+              audio: { output: { voice: $("voice").value } },
+            },
+          }),
+        })
+      : await fetch(`${base}/v1/realtime/calls?model=${encodeURIComponent($("model").value)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/sdp" },
+          body: pc.localDescription.sdp,
+        });
+    const text = await res.text();
+    const reqId = res.headers.get("X-Upstream-Request-Id");
+    log(`POST /v1/realtime/calls -> ${res.status}${reqId ? ` (upstream request ${reqId})` : ""}`,
+        res.ok ? "ok" : "err");
+    if (!res.ok) { log(text || "(empty body)", "err"); stop(); return; }
+
+    await pc.setRemoteDescription({ type: "answer", sdp: text });
+    log("answer applied, session live", "ok");
+    $("stop").disabled = false;
+    $("mute").disabled = !micTrack;
+  } catch (err) {
+    log(`failed: ${err && err.message ? err.message : err}`, "err");
+    stop();
+  }
+}
+
+function stop() {
+  if (channel) { try { channel.close(); } catch {} channel = null; }
+  if (pc) { try { pc.close(); } catch {} pc = null; }
+  if (micTrack) { try { micTrack.stop(); } catch {} micTrack = null; }
+  $("start").disabled = false;
+  $("stop").disabled = true;
+  $("mute").disabled = true;
+  $("send").disabled = true;
+  log("call closed");
+}
+
+$("duplex").onchange = () => {
+  $("model").value = $("duplex").checked ? "gpt-live-1-codex" : "gpt-realtime-1.5";
+  fillVoices();
+};
+fillVoices();
+$("start").onclick = start;
+$("stop").onclick = stop;
+$("mute").onclick = () => {
+  if (!micTrack) return;
+  micTrack.enabled = !micTrack.enabled;
+  $("mute").textContent = micTrack.enabled ? "Mute mic" : "Unmute mic";
+};
+$("send").onclick = () => {
+  const text = $("say").value.trim();
+  if (!text || !channel || channel.readyState !== "open") return;
+  channel.send(JSON.stringify({
+    type: "conversation.item.create",
+    item: { type: "message", role: "user", content: [{ type: "input_text", text }] },
+  }));
+  channel.send(JSON.stringify({ type: "response.create" }));
+  log(`sent: ${text}`);
+  $("say").value = "";
+};
+</script>
+</body>
+</html>

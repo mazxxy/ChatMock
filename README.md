@@ -55,6 +55,51 @@ The server runs at `http://127.0.0.1:8000` by default. Use `http://127.0.0.1:800
 
 <br>
 
+## Realtime voice, including full duplex
+
+Your plan already pays for the voice models behind Codex, so ChatMock hands them
+to any client you like. The handshake has the same shape as the official docs --
+point the base URL at ChatMock and the sample code runs unchanged:
+
+```js
+const res = await fetch("http://127.0.0.1:8000/v1/realtime/calls?model=gpt-realtime-1.5", {
+  method: "POST",
+  body: offer.sdp,
+  headers: { "Content-Type": "application/sdp" },
+});
+await pc.setRemoteDescription({ type: "answer", sdp: await res.text() });
+```
+
+Audio never goes through ChatMock: it brokers the handshake and the media flows
+straight between your client and OpenAI.
+
+**Full duplex** -- talking over the model while it talks, instead of waiting for
+it to finish -- is the same route with a different intent:
+
+```js
+await fetch("http://127.0.0.1:8000/v1/realtime/calls?intent=quicksilver&architecture=avas", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    sdp: offer.sdp,
+    model: "gpt-live-1-codex",
+    session: { delegation: { type: "client" }, audio: { output: { voice: "vale" } } },
+  }),
+});
+```
+
+There is also `ws://127.0.0.1:8000/v1/realtime` for clients that speak the
+realtime socket protocol instead of WebRTC.
+
+`examples/realtime_voice.html` is a ready page to try all of it: microphone,
+live transcript, voice picker and a full-duplex switch. Serve the folder over
+`http://` (not `file://`) so the browser grants the microphone.
+
+The two modes take **disjoint voice rosters**, and the undocumented corners of
+this are written down in [FORK.md](FORK.md).
+
+<br>
+
 ## Example usage
 
 <details>
@@ -110,6 +155,8 @@ account. The current catalog commonly includes:
 - Fast mode for supported models
 - Web search tool
 - OpenAI-compatible `/v1/responses` (HTTP + WebSocket)
+- Realtime voice: `POST /v1/realtime/calls` (WebRTC handshake) and `ws://.../v1/realtime` (socket relay)
+- Full-duplex voice (GPT-Live): same route with `?intent=quicksilver&architecture=avas`
 - Ollama-compatible endpoints
 - Reasoning effort exposed as separate models (optional)
 
@@ -130,6 +177,7 @@ All flags go after `chatmock serve`. These can also be set as environment variab
 | `--model-sync` | `CHATGPT_LOCAL_MODEL_SYNC` | true/false | true | Discover account models automatically |
 | `--model-refresh-interval` | `CHATGPT_LOCAL_MODEL_REFRESH_INTERVAL` | seconds | 3600 | Refresh interval for model discovery |
 | `--image-model` | `CHATGPT_LOCAL_IMAGE_MODEL` | model slug | gpt-5.4-mini | Model that orchestrates image requests |
+| `--realtime-model` | `CHATGPT_LOCAL_REALTIME_MODEL` | model slug | gpt-realtime-1.5 | Voice model requested by the realtime routes |
 
 <details>
 <summary><b>Web search in a request</b></summary>

@@ -13,6 +13,7 @@ from .config import CLIENT_ID_DEFAULT
 from .images_api import DEFAULT_IMAGE_ORCHESTRATOR_MODEL
 from .limits import RateLimitWindow, compute_reset_at, load_rate_limit_snapshot
 from .oauth import OAuthHTTPServer, OAuthHandler, REQUIRED_PORT, URL_BASE, run_device_code_login
+from .realtime_api import DEFAULT_REALTIME_MODEL
 from .utils import eprint, get_home_dir, load_chatgpt_tokens, parse_jwt_claims, read_auth_file
 
 
@@ -244,6 +245,7 @@ def cmd_serve(
     model_sync: bool = True,
     model_refresh_interval: float = 3600,
     image_orchestrator_model: str | None = None,
+    realtime_model: str | None = None,
 ) -> int:
     app = create_app(
         verbose=verbose,
@@ -258,6 +260,7 @@ def cmd_serve(
         model_sync=model_sync,
         model_refresh_interval=model_refresh_interval,
         image_orchestrator_model=image_orchestrator_model,
+        realtime_model=realtime_model,
     )
 
     app.run(host=host, use_reloader=False, port=port, threaded=True)
@@ -358,6 +361,16 @@ def main() -> None:
         ),
     )
 
+    p_serve.add_argument(
+        "--realtime-model",
+        default=os.getenv("CHATGPT_LOCAL_REALTIME_MODEL", DEFAULT_REALTIME_MODEL),
+        metavar="MODEL",
+        help=(
+            "Voice model requested by /v1/realtime/calls. The backend has the last word, "
+            f"same as with images (default: {DEFAULT_REALTIME_MODEL})."
+        ),
+    )
+
     p_info = sub.add_parser("info", help="Print current stored tokens and derived account id")
     p_info.add_argument("--json", action="store_true", help="Output raw auth.json contents")
 
@@ -382,6 +395,7 @@ def main() -> None:
                 model_sync=args.model_sync,
                 model_refresh_interval=args.model_refresh_interval,
                 image_orchestrator_model=args.image_model,
+                realtime_model=args.realtime_model,
             )
         )
     elif args.command == "info":

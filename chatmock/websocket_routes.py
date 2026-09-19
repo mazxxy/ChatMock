@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import ssl
+import threading
+import uuid
 from typing import Any, Dict
 
 import certifi
@@ -11,6 +13,11 @@ from flask_sock import Sock
 from websockets.sync.client import connect as websocket_connect
 from websockets.exceptions import ConnectionClosed
 
+from .realtime_api import (
+    DEFAULT_REALTIME_MODEL,
+    build_realtime_websocket_headers,
+    build_realtime_websocket_url,
+)
 from .responses_api import (
     ResponsesRequestError,
     extract_client_session_id,
@@ -68,6 +75,92 @@ def connect_upstream_websocket(url: str, headers: Dict[str, str]):
 
 
 def register_websocket_routes(sock: Sock) -> None:
+    @sock.route("/v1/realtime")
+    def realtime_websocket(ws) -> None:
+        """Relay a realtime voice session, frame for frame.
+
+        Same shape as the official socket, so a client only swaps the URL. Both
+        sides are free to talk at any time: nothing here waits for a turn.
+        """
+        verbose = bool(current_app.config.get("VERBOSE"))
+        model = (
+            request.args.get("model")
+            or current_app.config.get("REALTIME_MODEL")
+            or DEFAULT_REALTIME_MODEL
+        )
+        extra_query = {k: v for k, v in request.args.items() if k != "model"}
+
+        access_token, account_id = get_effective_chatgpt_auth()
+        if not access_token or not account_id:
+            evt = _error_event(
+                "Missing ChatGPT credentials. Run 'python3 chatmock.py login' first.",
+                status_code=401,
+            )
+            try:
+                ws.send(json.dumps(evt))
+            except Exception:
+                pass
+            return
+
+        session_id = extract_client_session_id(request.headers) or uuid.uuid4().hex
+        try:
+            upstream_ws = connect_upstream_websocket(
+                build_realtime_websocket_url(model, extra_query),
+                build_realtime_websocket_headers(access_token, account_id, session_id),
+            )
+        except Exception as exc:
+            evt = _error_event(f"Upstream websocket connection failed: {exc}", status_code=502)
+            try:
+                ws.send(json.dumps(evt))
+            except Exception:
+                pass
+            return
+
+        stop = threading.Event()
+
+        def pump_upstream() -> None:
+            # The only thread that writes to the client, so the two directions
+            # never race on the same socket.
+            try:
+                while not stop.is_set():
+                    message = upstream_ws.recv()
+                    if message is None:
+                        break
+                    if verbose:
+                        try:
+                            print("STREAM OUT WS /v1/realtime\n" + str(message)[:2000])
+                        except Exception:
+                            pass
+                    ws.send(message)
+            except Exception:
+                pass
+            finally:
+                stop.set()
+
+        pump = threading.Thread(target=pump_upstream, daemon=True)
+        pump.start()
+
+        try:
+            while not stop.is_set():
+                incoming = ws.receive()
+                if incoming is None:
+                    break
+                if verbose:
+                    try:
+                        print("IN WS /v1/realtime\n" + str(incoming)[:2000])
+                    except Exception:
+                        pass
+                upstream_ws.send(incoming)
+        except Exception:
+            pass
+        finally:
+            stop.set()
+            try:
+                upstream_ws.close()
+            except Exception:
+                pass
+            pump.join(timeout=2)
+
     @sock.route("/v1/responses")
     def responses_websocket(ws) -> None:
         verbose = bool(current_app.config.get("VERBOSE"))

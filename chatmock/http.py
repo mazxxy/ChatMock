@@ -11,6 +11,9 @@ def build_cors_headers() -> dict:
         "Access-Control-Allow-Origin": origin,
         "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
         "Access-Control-Allow-Headers": allow_headers,
+        # A browser cannot read these off a cross-origin response unless they
+        # are named here, and /v1/realtime/calls answers with both.
+        "Access-Control-Expose-Headers": "Location, X-Upstream-Request-Id",
         "Access-Control-Max-Age": "86400",
     }
 

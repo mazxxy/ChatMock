@@ -8,6 +8,7 @@ from flask_sock import Sock
 from .http import build_cors_headers
 from .images_api import DEFAULT_IMAGE_ORCHESTRATOR_MODEL
 from .model_catalog import DEFAULT_REFRESH_INTERVAL_SECONDS, ModelCatalog
+from .realtime_api import DEFAULT_REALTIME_MODEL
 from .routes_openai import openai_bp
 from .routes_ollama import ollama_bp
 from .websocket_routes import register_websocket_routes
@@ -26,12 +27,15 @@ def create_app(
     model_sync: bool | None = None,
     model_refresh_interval: float | None = None,
     image_orchestrator_model: str | None = None,
+    realtime_model: str | None = None,
 ) -> Flask:
     app = Flask(__name__)
     if not (isinstance(image_orchestrator_model, str) and image_orchestrator_model.strip()):
         image_orchestrator_model = (
             os.getenv("CHATGPT_LOCAL_IMAGE_MODEL") or DEFAULT_IMAGE_ORCHESTRATOR_MODEL
         )
+    if not (isinstance(realtime_model, str) and realtime_model.strip()):
+        realtime_model = os.getenv("CHATGPT_LOCAL_REALTIME_MODEL") or DEFAULT_REALTIME_MODEL
     if model_sync is None:
         model_sync = (os.getenv("CHATGPT_LOCAL_MODEL_SYNC") or "true").strip().lower() in (
             "1",
@@ -60,6 +64,7 @@ def create_app(
         MODEL_SYNC=bool(model_sync),
         MODEL_REFRESH_INTERVAL=float(model_refresh_interval),
         IMAGE_ORCHESTRATOR_MODEL=image_orchestrator_model.strip(),
+        REALTIME_MODEL=realtime_model.strip(),
     )
     app.extensions["chatmock_model_catalog"] = ModelCatalog(
         enabled=bool(model_sync),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import socket
 import threading
 import time
@@ -901,6 +902,208 @@ class ImageRouteTests(unittest.TestCase):
         body = response.get_json()
         self.assertEqual(response.status_code, 200)
         self.assertEqual([item["type"] for item in body["output"]], ["reasoning", "message"])
+
+
+OFFER_SDP = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+ANSWER_SDP = b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+
+
+class RealtimeRouteTests(unittest.TestCase):
+    def setUp(self) -> None:
+        reset_session_state()
+        self.app = create_app(model_sync=False)
+        self.client = self.app.test_client()
+
+    @patch("chatmock.realtime_api.get_effective_chatgpt_auth", return_value=("token", "acct"))
+    @patch("chatmock.realtime_api.requests.post")
+    def test_realtime_call_brokers_the_offer(self, mock_post, _mock_auth) -> None:
+        mock_post.return_value = FakeUpstream(
+            status_code=201,
+            headers={"Content-Type": "application/sdp", "x-oai-request-id": "req_1"},
+            content=ANSWER_SDP,
+        )
+        response = self.client.post(
+            "/v1/realtime/calls",
+            data=OFFER_SDP,
+            content_type="application/sdp",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_data(), ANSWER_SDP)
+        self.assertEqual(response.headers["Content-Type"], "application/sdp")
+        self.assertEqual(response.headers["X-Upstream-Request-Id"], "req_1")
+
+        kwargs = mock_post.call_args.kwargs
+        self.assertEqual(
+            kwargs["json"],
+            {"sdp": OFFER_SDP, "session": {"type": "realtime", "model": "gpt-realtime-1.5"}},
+        )
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer token")
+        self.assertEqual(kwargs["headers"]["ChatGPT-Account-ID"], "acct")
+
+    @patch("chatmock.realtime_api.get_effective_chatgpt_auth", return_value=("token", "acct"))
+    @patch("chatmock.realtime_api.requests.post")
+    def test_realtime_call_unwraps_json_answer(self, mock_post, _mock_auth) -> None:
+        mock_post.return_value = FakeUpstream(
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            content=json.dumps({"sdp": ANSWER_SDP.decode("utf-8")}).encode("utf-8"),
+        )
+        response = self.client.post(
+            "/v1/realtime/calls",
+            data=OFFER_SDP,
+            content_type="application/sdp",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["Content-Type"], "application/sdp")
+        self.assertEqual(response.get_data(), ANSWER_SDP)
+
+    @patch("chatmock.realtime_api.get_effective_chatgpt_auth", return_value=("token", "acct"))
+    @patch("chatmock.realtime_api.requests.post")
+    def test_realtime_call_accepts_json_envelope_and_model_query(self, mock_post, _mock_auth) -> None:
+        mock_post.return_value = FakeUpstream(
+            status_code=200,
+            headers={"Content-Type": "application/sdp"},
+            content=ANSWER_SDP,
+        )
+        response = self.client.post(
+            "/v1/realtime/calls?model=gpt-live-1-codex&voice=cedar",
+            json={
+                "sdp": OFFER_SDP,
+                "model": "ignored-because-the-query-wins",
+                "session": {"instructions": "be brief"},
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        kwargs = mock_post.call_args.kwargs
+        # The client's session rides through as it is -- only the model is
+        # resolved -- because "type" is what picks turn-taking vs full duplex.
+        self.assertEqual(
+            kwargs["json"]["session"],
+            {"model": "gpt-live-1-codex", "instructions": "be brief"},
+        )
+        self.assertEqual(kwargs["params"], {"voice": "cedar"})
+
+    @patch("chatmock.realtime_api.requests.post")
+    def test_realtime_call_rejects_body_without_offer(self, mock_post) -> None:
+        response = self.client.post("/v1/realtime/calls", json={"model": "gpt-realtime-1.5"})
+        body = response.get_json()
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("'sdp'", body["error"]["message"])
+        mock_post.assert_not_called()
+
+    @patch("chatmock.realtime_api.get_effective_chatgpt_auth", return_value=("token", "acct"))
+    @patch("chatmock.realtime_api.requests.post")
+    def test_realtime_call_explains_empty_upstream_rejection(self, mock_post, _mock_auth) -> None:
+        mock_post.return_value = FakeUpstream(
+            status_code=400,
+            headers={"x-oai-request-id": "req_2"},
+            content=b"",
+        )
+        response = self.client.post(
+            "/v1/realtime/calls",
+            data=OFFER_SDP,
+            content_type="application/sdp",
+        )
+        body = response.get_json()
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("req_2", body["error"]["message"])
+        self.assertEqual(body["error"]["code"], "upstream_error")
+
+    @patch("chatmock.realtime_api.get_effective_chatgpt_auth", return_value=("token", "acct"))
+    @patch("chatmock.realtime_api.requests.post")
+    def test_realtime_call_full_duplex_asks_for_quicksilver(self, mock_post, _mock_auth) -> None:
+        mock_post.return_value = FakeUpstream(
+            status_code=201,
+            headers={"Content-Type": "application/sdp"},
+            content=ANSWER_SDP,
+        )
+        response = self.client.post(
+            "/v1/realtime/calls?intent=quicksilver&architecture=avas",
+            json={
+                "sdp": OFFER_SDP,
+                "model": "gpt-live-1-codex",
+                "session": {"delegation": {"type": "client"}},
+            },
+        )
+        self.assertEqual(response.status_code, 201)
+
+        kwargs = mock_post.call_args.kwargs
+        self.assertEqual(kwargs["params"], {"intent": "quicksilver", "architecture": "avas"})
+        # Without the alpha header the backend answers "AVAS requires
+        # OpenAI-Alpha: quicksilver=v2".
+        self.assertEqual(kwargs["headers"]["OpenAI-Alpha"], "quicksilver=v2")
+        # A live session carries no "type": that is what forces turn-taking mode
+        # and gets the live model refused.
+        self.assertNotIn("type", kwargs["json"]["session"])
+        self.assertEqual(kwargs["json"]["session"]["model"], "gpt-live-1-codex")
+        self.assertEqual(kwargs["json"]["session"]["delegation"], {"type": "client"})
+
+    @patch("chatmock.websocket_routes.get_effective_chatgpt_auth", return_value=("token", "acct"))
+    @patch("chatmock.websocket_routes.connect_upstream_websocket")
+    def test_realtime_websocket_relays_both_directions(self, mock_connect, _mock_auth) -> None:
+        class FakeRealtimeUpstream:
+            def __init__(self) -> None:
+                self.sent: list[str] = []
+                self._inbox: queue.Queue[str] = queue.Queue()
+                self._closed = threading.Event()
+                self._inbox.put(json.dumps({"type": "session.created"}))
+
+            def recv(self):
+                while not self._closed.is_set():
+                    try:
+                        return self._inbox.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
+                return None
+
+            def send(self, message: str) -> None:
+                self.sent.append(message)
+                self._inbox.put(json.dumps({"type": "echo", "payload": message}))
+
+            def close(self) -> None:
+                self._closed.set()
+
+        fake_upstream = FakeRealtimeUpstream()
+        mock_connect.return_value = fake_upstream
+
+        app = create_app(model_sync=False)
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        host, port = sock.getsockname()
+        sock.close()
+
+        server_thread = threading.Thread(
+            target=app.run,
+            kwargs={"host": host, "port": port, "use_reloader": False, "threaded": True},
+            daemon=True,
+        )
+        server_thread.start()
+        time.sleep(0.5)
+
+        with ws_connect(f"ws://{host}:{port}/v1/realtime?model=gpt-live-1-codex&voice=cedar") as client:
+            created = json.loads(client.recv())
+            client.send(json.dumps({"type": "input_audio_buffer.append", "audio": "AAAA"}))
+            echoed = json.loads(client.recv())
+
+        self.assertEqual(created["type"], "session.created")
+        self.assertEqual(echoed["type"], "echo")
+        self.assertIn("input_audio_buffer.append", echoed["payload"])
+        upstream_url = mock_connect.call_args.args[0]
+        self.assertIn("model=gpt-live-1-codex", upstream_url)
+        self.assertIn("voice=cedar", upstream_url)
+        # The GA socket rejects the beta shape, so the header must not ride along.
+        self.assertNotIn("OpenAI-Beta", mock_connect.call_args.args[1])
+
+    @patch("chatmock.realtime_api.get_effective_chatgpt_auth", return_value=(None, None))
+    @patch("chatmock.realtime_api.requests.post")
+    def test_realtime_call_requires_login(self, mock_post, _mock_auth) -> None:
+        response = self.client.post(
+            "/v1/realtime/calls",
+            data=OFFER_SDP,
+            content_type="application/sdp",
+        )
+        self.assertEqual(response.status_code, 401)
+        mock_post.assert_not_called()
 
 
 if __name__ == "__main__":

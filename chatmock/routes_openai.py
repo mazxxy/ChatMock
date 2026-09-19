@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from typing import Any, Dict, List
 
 from flask import Blueprint, Response, current_app, jsonify, make_response, request
@@ -19,6 +20,15 @@ from .images_api import (
 from .limits import record_rate_limits_from_response
 from .http import build_cors_headers
 from .model_registry import list_public_models
+from .realtime_api import (
+    DEFAULT_REALTIME_MODEL,
+    SDP_CONTENT_TYPE,
+    RealtimeRequestError,
+    answer_from_response,
+    extract_offer,
+    forward_realtime_live,
+    forward_realtime_offer,
+)
 from .responses_api import (
     ResponsesRequestError,
     aggregate_response_from_sse,
@@ -910,6 +920,158 @@ def images_generations() -> Response:
         print(f"OUT POST /v1/images/generations ({len(collected)} image(s))")
 
     resp = make_response(jsonify(body), 200)
+    for k, v in build_cors_headers().items():
+        resp.headers.setdefault(k, v)
+    return resp
+
+
+def _realtime_error(message: str, status: int, code: str | None = None) -> Response:
+    body: Dict[str, Any] = {"error": {"message": message}}
+    if code:
+        body["error"]["code"] = code
+    resp = make_response(jsonify(body), status)
+    for k, v in build_cors_headers().items():
+        resp.headers.setdefault(k, v)
+    return resp
+
+
+@openai_bp.route("/v1/realtime/calls/live", methods=["POST"])
+def realtime_calls_live() -> Response:
+    """Full duplex: relay the handshake the Codex app uses, untouched."""
+    verbose = bool(current_app.config.get("VERBOSE"))
+    raw = request.get_data(cache=True) or b""
+    if verbose:
+        try:
+            redacted = {
+                k: ("<redacted>" if k.lower() in ("authorization", "cookie", "chatgpt-account-id") else v)
+                for k, v in request.headers.items()
+            }
+            print(
+                "IN POST /v1/realtime/calls/live "
+                f"(query {dict(request.args)})\nHEADERS {json.dumps(redacted, indent=2)}\n"
+                + raw.decode("utf-8", errors="ignore")[:80000]
+            )
+        except Exception:
+            pass
+
+    session_id = extract_client_session_id(request.headers) or uuid.uuid4().hex
+    try:
+        upstream = forward_realtime_live(
+            raw,
+            content_type=request.headers.get("Content-Type"),
+            accept=request.headers.get("Accept"),
+            session_id=session_id,
+            extra_headers=dict(request.headers),
+            extra_query=dict(request.args),
+        )
+    except RealtimeRequestError as exc:
+        return _realtime_error(str(exc), exc.status_code, exc.code)
+
+    record_rate_limits_from_response(upstream)
+    body = upstream.content or b""
+    request_id = upstream.headers.get("x-oai-request-id") or ""
+    if verbose:
+        try:
+            print(
+                f"STREAM OUT /v1/realtime/calls/live {upstream.status_code} "
+                f"(content-type {upstream.headers.get('Content-Type')!r}, "
+                f"request id {request_id or 'unknown'})\n" + body.decode("utf-8", errors="ignore")[:4000]
+            )
+        except Exception:
+            pass
+
+    resp = make_response(body, upstream.status_code)
+    resp.headers["Content-Type"] = upstream.headers.get("Content-Type") or SDP_CONTENT_TYPE
+    location = upstream.headers.get("Location")
+    if location:
+        resp.headers["Location"] = location
+    if request_id:
+        resp.headers["X-Upstream-Request-Id"] = request_id
+    for k, v in build_cors_headers().items():
+        resp.headers.setdefault(k, v)
+    return resp
+
+
+@openai_bp.route("/v1/realtime/calls", methods=["POST"])
+def realtime_calls() -> Response:
+    """Broker the WebRTC handshake of a voice session.
+
+    The client posts its SDP offer, ChatMock signs it with the Codex
+    credentials and hands back the backend's answer. Audio never passes through
+    here: it flows straight between the client and OpenAI.
+    """
+    verbose = bool(current_app.config.get("VERBOSE"))
+    raw = request.get_data(cache=True, as_text=True) or ""
+    if verbose:
+        try:
+            print("IN POST /v1/realtime/calls\n" + raw[:2000])
+        except Exception:
+            pass
+
+    try:
+        offer_sdp, body_model, session = extract_offer(raw, request.headers.get("Content-Type"))
+    except RealtimeRequestError as exc:
+        return _realtime_error(str(exc), exc.status_code, exc.code)
+
+    model = (
+        request.args.get("model")
+        or body_model
+        or current_app.config.get("REALTIME_MODEL")
+        or DEFAULT_REALTIME_MODEL
+    )
+    # Anything else the client put on the query string rides along: the backend
+    # is undocumented and this is the knob to experiment with it.
+    extra_query = {k: v for k, v in request.args.items() if k != "model"}
+
+    session_id = extract_client_session_id(request.headers) or uuid.uuid4().hex
+    try:
+        upstream = forward_realtime_offer(
+            offer_sdp,
+            model=model,
+            session_id=session_id,
+            session=session,
+            extra_query=extra_query,
+        )
+    except RealtimeRequestError as exc:
+        return _realtime_error(str(exc), exc.status_code, exc.code)
+
+    record_rate_limits_from_response(upstream)
+    answer = upstream.content or b""
+    request_id = upstream.headers.get("x-oai-request-id") or ""
+    if verbose:
+        try:
+            print(
+                f"STREAM OUT /v1/realtime/calls {upstream.status_code} "
+                f"(request id {request_id or 'unknown'})\n" + answer.decode("utf-8", errors="ignore")[:2000]
+            )
+        except Exception:
+            pass
+
+    if upstream.status_code >= 400 and not answer.strip():
+        # The realtime backend answers a rejected offer with an empty body, so
+        # the request id is the only thread left to pull.
+        message = f"The realtime backend refused the offer (HTTP {upstream.status_code}) without a message."
+        if request_id:
+            message += f" Upstream request id: {request_id}."
+        return _realtime_error(message, upstream.status_code, code="upstream_error")
+
+    upstream_type = upstream.headers.get("Content-Type")
+    # The backend answers in JSON; hand the bare SDP back so an OpenAI realtime
+    # client can feed it straight to setRemoteDescription().
+    answer_sdp = answer_from_response(answer, upstream_type)
+    if answer_sdp is not None:
+        answer = answer_sdp.encode("utf-8")
+        upstream_type = SDP_CONTENT_TYPE
+
+    resp = make_response(answer, upstream.status_code)
+    resp.headers["Content-Type"] = upstream_type or SDP_CONTENT_TYPE
+    # The official API points at the call with Location; keep it so a client can
+    # follow up on /v1/realtime/calls/{id}.
+    location = upstream.headers.get("Location")
+    if location:
+        resp.headers["Location"] = location
+    if request_id:
+        resp.headers["X-Upstream-Request-Id"] = request_id
     for k, v in build_cors_headers().items():
         resp.headers.setdefault(k, v)
     return resp
