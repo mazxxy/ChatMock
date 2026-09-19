@@ -55,11 +55,23 @@ The server runs at `http://127.0.0.1:8000` by default. Use `http://127.0.0.1:800
 
 <br>
 
-## Realtime voice, including full duplex
+## Realtime: voice, video and transcription
 
 Your plan already pays for the voice models behind Codex, so ChatMock hands them
-to any client you like. The handshake has the same shape as the official docs --
-point the base URL at ChatMock and the sample code runs unchanged:
+to any client you like:
+
+| What | Where |
+|---|---|
+| Voice, one turn at a time | `POST /v1/realtime/calls` -- the official handshake, bare SDP in, SDP out |
+| Voice, full duplex (GPT-Live) | same route with `?intent=quicksilver&architecture=avas` |
+| Camera or screen | a video track in the offer, turn-taking mode |
+| Transcription only (`whisper-1` & co.) | `ws://…/v1/realtime?intent=transcription` |
+| Realtime socket instead of WebRTC | `ws://…/v1/realtime` |
+
+### Voice
+
+The handshake has the same shape as the official docs -- point the base URL at
+ChatMock and the sample code runs unchanged:
 
 ```js
 const res = await fetch("http://127.0.0.1:8000/v1/realtime/calls?model=gpt-realtime-1.5", {
@@ -73,8 +85,11 @@ await pc.setRemoteDescription({ type: "answer", sdp: await res.text() });
 Audio never goes through ChatMock: it brokers the handshake and the media flows
 straight between your client and OpenAI.
 
-**Full duplex** -- talking over the model while it talks, instead of waiting for
-it to finish -- is the same route with a different intent:
+### Full duplex
+
+Talking over the model while it talks, instead of waiting for it to finish. Same
+route, different intent -- and the session must carry no `type`, which is what
+picks turn-taking:
 
 ```js
 await fetch("http://127.0.0.1:8000/v1/realtime/calls?intent=quicksilver&architecture=avas", {
@@ -88,20 +103,59 @@ await fetch("http://127.0.0.1:8000/v1/realtime/calls?intent=quicksilver&architec
 });
 ```
 
-There is also `ws://127.0.0.1:8000/v1/realtime` for clients that speak the
-realtime socket protocol instead of WebRTC.
+The two voice modes take **disjoint voice rosters**: full duplex answers to the
+ChatGPT voices (`vale`, `arbor`, `breeze`, `cove`, `ember`, `juniper`, `maple`,
+`sol`, `spruce`, `glimmer`, `orbit`, `fathom`), turn-taking to the API ones
+(`alloy`, `ash`, `ballad`, `coral`, `echo`, `sage`, `shimmer`, `verse`, `marin`,
+`cedar`). The wrong list is a flat 403.
 
-**Camera and screen** work in turn-taking mode: offer a video track in the SDP
-and the answer negotiates it (full duplex takes audio only). **Transcription**
-has its own session -- `ws://127.0.0.1:8000/v1/realtime?intent=transcription`,
-then pick `whisper-1`, `gpt-4o-transcribe` or another in `session.update`.
+### Camera and screen
 
-`examples/realtime_voice.html` is a ready page to try all of it: microphone,
-live transcript, voice picker and a full-duplex switch. Serve the folder over
-`http://` (not `file://`) so the browser grants the microphone.
+Turn-taking negotiates video: add a track to the offer and the answer comes back
+with it. Camera and screen share are the same thing here -- `getUserMedia` or
+`getDisplayMedia`, your pick. Nothing to configure on the server, since the whole
+offer is forwarded as it is. Full duplex is audio only and rejects a video
+offer.
 
-The two modes take **disjoint voice rosters**, and the undocumented corners of
-this are written down in [FORK.md](FORK.md).
+```js
+const screen = await navigator.mediaDevices.getDisplayMedia({ video: true });
+pc.addTrack(screen.getVideoTracks()[0], screen);
+```
+
+### Transcription
+
+A session that only listens, with no voice model attached. The model is picked
+in `session.update`, never in the query:
+
+```js
+const ws = new WebSocket("ws://127.0.0.1:8000/v1/realtime?intent=transcription");
+ws.onopen = () => ws.send(JSON.stringify({
+  type: "session.update",
+  session: { type: "transcription", audio: { input: { transcription: { model: "whisper-1" } } } },
+}));
+// then stream PCM16 with input_audio_buffer.append
+```
+
+Accepted models: `whisper-1`, `gpt-realtime-whisper`, `gpt-live-transcribe`,
+`gpt-transcribe`, `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, and two dated
+mini builds.
+
+### Try it
+
+Two ready pages, both in `examples/`. Serve the folder over `http://` (not
+`file://`) so the browser grants the microphone:
+
+- `realtime_voice.html` -- microphone, live transcript, voice picker, video
+  off/camera/screen, and a full-duplex switch.
+- `transcribe.html` -- microphone in, text out, with the model picker.
+
+```bash
+python -m http.server 8080 --directory examples
+```
+
+The undocumented corners -- why the session carries no `type`, which header the
+backend demands, what `delegation` accepts -- are written down in
+[FORK.md](FORK.md).
 
 <br>
 
@@ -147,6 +201,8 @@ account. The current catalog commonly includes:
 - `gpt-5.4`
 - `gpt-5.4-mini`
 - `gpt-5.3-codex-spark`
+- `gpt-6-astra` -- answers when you name it, but the account catalog does not
+  advertise it, so it only shows up in `/v1/models` with `--model-sync false`
 
 <br>
 

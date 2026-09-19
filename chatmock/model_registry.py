@@ -63,6 +63,13 @@ _MODEL_SPECS = (
         variant_efforts=("xhigh", "high", "medium", "low", "none"),
     ),
     ModelSpec(
+        public_id="gpt-6-astra",
+        upstream_id="gpt-6-astra",
+        aliases=("gpt6-astra", "gpt-6-astra-latest"),
+        allowed_efforts=frozenset(("low", "medium", "high", "xhigh", "max", "ultra")),
+        variant_efforts=("low", "medium", "high", "xhigh", "max", "ultra"),
+    ),
+    ModelSpec(
         public_id="gpt-5.6-sol",
         upstream_id="gpt-5.6-sol",
         aliases=("gpt5.6-sol", "gpt-5.6-sol-latest"),
