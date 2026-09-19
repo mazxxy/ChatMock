@@ -83,11 +83,16 @@ def register_websocket_routes(sock: Sock) -> None:
         sides are free to talk at any time: nothing here waits for a turn.
         """
         verbose = bool(current_app.config.get("VERBOSE"))
-        model = (
-            request.args.get("model")
-            or current_app.config.get("REALTIME_MODEL")
-            or DEFAULT_REALTIME_MODEL
-        )
+        requested_model = request.args.get("model")
+        if not requested_model and request.args.get("intent") == "transcription":
+            # Transcription sessions take no model here; it goes in session.update.
+            model = None
+        else:
+            model = (
+                requested_model
+                or current_app.config.get("REALTIME_MODEL")
+                or DEFAULT_REALTIME_MODEL
+            )
         extra_query = {k: v for k, v in request.args.items() if k != "model"}
 
         access_token, account_id = get_effective_chatgpt_auth()

@@ -276,6 +276,54 @@ No duplex a voz vai no `session` do próprio handshake
 (`audio.output.voice`). No turn-taking, como o handshake é o SDP cru da
 documentação, ela entra no `session.update` que a página manda ao abrir o canal.
 
+### Vídeo (câmera e tela)
+
+O turn-taking **negocia vídeo**. Oferecendo `m=video` no SDP, a resposta volta
+`201` com `m=video 9 UDP/TLS/RTP/SAVPF ...` e payloads H264 — porta não zerada,
+ou seja, aceito de verdade. Serve para câmera (`getUserMedia`) e para tela
+(`getDisplayMedia`), que do lado do WebRTC são a mesma coisa.
+
+Não precisou de nada no ChatMock: vídeo é negociação de SDP, e a rota repassa a
+oferta inteira. Quem decide é o cliente — a página de exemplo tem o seletor
+`Video: off / camera / screen`.
+
+O duplex **não aceita**: com `m=video` na oferta, o handshake morre em 403
+`Voice session access denied`, o mesmo erro genérico da voz inválida.
+
+### Transcrição (whisper e afins)
+
+`?intent=transcription` abre uma sessão de transcrição pura, sem modelo de voz:
+
+```
+ws://127.0.0.1:8000/v1/realtime?intent=transcription
+```
+
+O modelo entra depois, no `session.update`:
+
+```json
+{ "type": "session.update",
+  "session": { "type": "transcription",
+    "audio": { "input": { "transcription": { "model": "whisper-1" } } } } }
+```
+
+Aceitos (o backend enumera quando você erra): `whisper-1`,
+`gpt-realtime-whisper`, `gpt-live-transcribe`, `gpt-transcribe`,
+`gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, `gpt-4o-mini-transcribe-2025-03-20`,
+`gpt-4o-mini-transcribe-2025-12-15`.
+
+Pegadinha: a sessão de transcrição **recusa `model` na query**
+("You must not provide a model parameter for transcription sessions"), então a
+rota de socket omite o padrão quando vê `intent=transcription`.
+
+### Delegação
+
+O `session.delegation.type` do duplex aceita `client` e `responses`. Com
+`client`, o modelo de voz espera que **o seu cliente** execute o trabalho pesado
+(é o `SpawnThinking` das instruções do app). Com `responses`, ele exige
+`delegation.responses.model` — e aí a chamada volta 403
+`Voice session access denied`, testado com `gpt-5.6-sol` e `gpt-6-astra`. Ou
+seja: existe, mas está fechado para esta credencial.
+
 ### Como isso apareceu
 
 Adivinhação não chegou lá — foram ~40 combinações de `intent`, modelo,

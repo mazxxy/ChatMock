@@ -186,9 +186,13 @@ def forward_realtime_live(
     return upstream
 
 
-def build_realtime_websocket_url(model: str, extra_query: Dict[str, str] | None = None) -> str:
+def build_realtime_websocket_url(model: str | None, extra_query: Dict[str, str] | None = None) -> str:
     params: Dict[str, str] = dict(extra_query or {})
-    params["model"] = model
+    # A transcription session picks its model inside session.update and refuses
+    # the query parameter: "You must not provide a model parameter for
+    # transcription sessions."
+    if model:
+        params["model"] = model
     return f"{CHATGPT_REALTIME_WS_URL}?{urlencode(params)}"
 
 

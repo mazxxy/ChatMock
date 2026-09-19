@@ -28,6 +28,13 @@
   <label>Server <input type="text" id="base" value="http://127.0.0.1:8000" /></label>
   <label>Model <input type="text" id="model" value="gpt-realtime-1.5" /></label>
   <label>Voice <select id="voice"></select></label>
+  <label>Video
+    <select id="video">
+      <option value="off">off</option>
+      <option value="camera">camera</option>
+      <option value="screen">screen</option>
+    </select>
+  </label>
   <label><input type="checkbox" id="duplex" /> Full duplex (GPT-Live)</label>
 </div>
 <div class="row">
@@ -45,7 +52,7 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const logEl = $("log");
-let pc = null, channel = null, micTrack = null;
+let pc = null, channel = null, micTrack = null, videoTrack = null;
 
 // The two modes take disjoint voice rosters: full duplex only answers to the
 // ChatGPT voices, turn-taking only to the API ones. The wrong list is a 403
@@ -101,6 +108,24 @@ async function start() {
     pc = new RTCPeerConnection();
     if (micTrack) pc.addTrack(micTrack, stream);
     else pc.addTransceiver("audio", { direction: "recvonly" });
+
+    // Turn-taking negotiates a video track (the answer comes back with H264).
+    // Full duplex refuses one: the handshake fails with 403.
+    const videoMode = $("video").value;
+    if (videoMode !== "off" && !$("duplex").checked) {
+      try {
+        const vs = videoMode === "screen"
+          ? await navigator.mediaDevices.getDisplayMedia({ video: true })
+          : await navigator.mediaDevices.getUserMedia({ video: true });
+        videoTrack = vs.getVideoTracks()[0];
+        pc.addTrack(videoTrack, vs);
+        log(`sending ${videoMode}`, "ok");
+      } catch (err) {
+        log(`no video (${err && err.name ? err.name : err})`);
+      }
+    } else if (videoMode !== "off") {
+      log("full duplex does not take video; ignoring it");
+    }
     pc.ontrack = (e) => { $("remote").srcObject = e.streams[0]; log("remote audio track attached", "ok"); };
     pc.onconnectionstatechange = () => log(`connection: ${pc.connectionState}`);
 
@@ -182,6 +207,7 @@ function stop() {
   if (channel) { try { channel.close(); } catch {} channel = null; }
   if (pc) { try { pc.close(); } catch {} pc = null; }
   if (micTrack) { try { micTrack.stop(); } catch {} micTrack = null; }
+  if (videoTrack) { try { videoTrack.stop(); } catch {} videoTrack = null; }
   $("start").disabled = false;
   $("stop").disabled = true;
   $("mute").disabled = true;

@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from chatmock.app import create_app
+from chatmock.realtime_api import build_realtime_websocket_url
 from chatmock.session import reset_session_state
 from websockets.sync.client import connect as ws_connect
 
@@ -1091,6 +1092,9 @@ class RealtimeRouteTests(unittest.TestCase):
         upstream_url = mock_connect.call_args.args[0]
         self.assertIn("model=gpt-live-1-codex", upstream_url)
         self.assertIn("voice=cedar", upstream_url)
+        self.assertIn("intent=transcription", build_realtime_websocket_url(None, {"intent": "transcription"}))
+        # "You must not provide a model parameter for transcription sessions."
+        self.assertNotIn("model=", build_realtime_websocket_url(None, {"intent": "transcription"}))
         # The GA socket rejects the beta shape, so the header must not ride along.
         self.assertNotIn("OpenAI-Beta", mock_connect.call_args.args[1])
 

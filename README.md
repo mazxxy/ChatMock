@@ -91,6 +91,11 @@ await fetch("http://127.0.0.1:8000/v1/realtime/calls?intent=quicksilver&architec
 There is also `ws://127.0.0.1:8000/v1/realtime` for clients that speak the
 realtime socket protocol instead of WebRTC.
 
+**Camera and screen** work in turn-taking mode: offer a video track in the SDP
+and the answer negotiates it (full duplex takes audio only). **Transcription**
+has its own session -- `ws://127.0.0.1:8000/v1/realtime?intent=transcription`,
+then pick `whisper-1`, `gpt-4o-transcribe` or another in `session.update`.
+
 `examples/realtime_voice.html` is a ready page to try all of it: microphone,
 live transcript, voice picker and a full-duplex switch. Serve the folder over
 `http://` (not `file://`) so the browser grants the microphone.
@@ -157,6 +162,7 @@ account. The current catalog commonly includes:
 - OpenAI-compatible `/v1/responses` (HTTP + WebSocket)
 - Realtime voice: `POST /v1/realtime/calls` (WebRTC handshake) and `ws://.../v1/realtime` (socket relay)
 - Full-duplex voice (GPT-Live): same route with `?intent=quicksilver&architecture=avas`
+- Camera / screen video into a realtime session, and transcription-only sessions (`whisper-1` and friends)
 - Ollama-compatible endpoints
 - Reasoning effort exposed as separate models (optional)
 
